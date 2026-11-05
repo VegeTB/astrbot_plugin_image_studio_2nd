@@ -218,9 +218,7 @@ class ImageStudioPlugin(Star):
                     if t_name in TOOL_NAMES:
                         tool.handler_module_path = main_module_path
                         tool.active = True
-                        if hasattr(self, t_name):
-                            tool.handler = getattr(self, t_name)
-                        # 强制写入标准参数 Schema，防止 docstring 解析失败导致被 Anthropic 忽略
+                        # 保留原有的 handler 包装，不进行暴力替换
                         if t_name in TOOL_SCHEMAS:
                             tool.parameters = dict(TOOL_SCHEMAS[t_name])
                         matched_tools.append(tool)
@@ -244,19 +242,16 @@ class ImageStudioPlugin(Star):
             if not tool_mgr:
                 return
 
-            # 如果 req.func_tool 为空，初始化 ToolSet
             if getattr(req, "func_tool", None) is None:
                 from astrbot.core.provider.func_tool_manager import ToolSet
                 req.func_tool = ToolSet()
 
-            # 获取注入前的工具名列表
             before_tools = []
             if hasattr(req.func_tool, "tools"):
                 before_tools = [getattr(t, "name", str(t)) for t in req.func_tool.tools]
             elif hasattr(req.func_tool, "__iter__"):
                 before_tools = [getattr(t, "name", str(t)) for t in req.func_tool]
 
-            # 将本插件的 4 个工具强制注入 req.func_tool
             injected = []
             for t_name in TOOL_NAMES:
                 existing = None
@@ -593,7 +588,7 @@ class ImageStudioPlugin(Star):
     # LLM 工具（供 AstrBot 智能体调用，兼容 Anthropic / OpenAI 协议）
     # ------------------------------------------------------------------ #
     @filter.llm_tool(name="text_to_image")
-    async def text_to_image(self, event: AstrMessageEvent, prompt: str = ""):
+    async def text_to_image(self, event: AstrMessageEvent, prompt: str = None, **kwargs):
         """根据文字描述生成图片并直接发送给用户。
 
         Args:
@@ -602,8 +597,12 @@ class ImageStudioPlugin(Star):
         if not self.config.get("register_llm_tools", True):
             yield event.plain_result("文生图工具未启用，请先在插件配置中开启。")
             return
+        prompt_text = (prompt or kwargs.get("prompt") or "").strip()
+        if not prompt_text:
+            yield event.plain_result("未收到有效的生成描述 prompt。")
+            return
         try:
-            paths = await self._generate_and_save(prompt.strip())
+            paths = await self._generate_and_save(prompt_text)
             for path in paths:
                 yield event.image_result(str(path))
             if not paths:
@@ -612,7 +611,7 @@ class ImageStudioPlugin(Star):
             yield event.plain_result(f"文生图失败：{exc}")
 
     @filter.llm_tool(name="image_to_image")
-    async def image_to_image(self, event: AstrMessageEvent, prompt: str = ""):
+    async def image_to_image(self, event: AstrMessageEvent, prompt: str = None, **kwargs):
         """根据用户当前消息附带的参考图片进行图生图（改图），并直接发送结果。
 
         Args:
@@ -621,19 +620,20 @@ class ImageStudioPlugin(Star):
         if not self.config.get("register_llm_tools", True):
             yield event.plain_result("图生图工具未启用，请先在插件配置中开启。")
             return
+        prompt_text = (prompt or kwargs.get("prompt") or "").strip()
         try:
             refs = await self._gather_image_paths(event)
             if not refs:
                 yield event.plain_result("没有找到参考图片，请先发送一张图片。")
                 return
-            paths = await self._generate_and_save(prompt.strip(), refs)
+            paths = await self._generate_and_save(prompt_text, refs)
             for path in paths:
                 yield event.image_result(str(path))
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"图生图失败：{exc}")
 
     @filter.llm_tool(name="svg_render")
-    async def svg_render(self, event: AstrMessageEvent, svg: str = ""):
+    async def svg_render(self, event: AstrMessageEvent, svg: str = None, **kwargs):
         """把完整 SVG 代码渲染成 PNG 图片并直接发送，用于流程图、图表、示意图、图标和海报等本地矢量绘图。
 
         Args:
@@ -642,15 +642,19 @@ class ImageStudioPlugin(Star):
         if not self.config.get("register_llm_tools", True):
             yield event.plain_result("SVG 绘图工具未启用，请先在插件配置中开启。")
             return
+        svg_content = (svg or kwargs.get("svg") or "").strip()
+        if not svg_content:
+            yield event.plain_result("未接收到有效的 SVG 内容。")
+            return
         try:
-            path = await self._render_svg_and_save(svg)
+            path = await self._render_svg_and_save(svg_content)
             yield event.image_result(str(path))
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"SVG 绘图失败：{exc}")
 
     @filter.llm_tool(name="create_animation")
-    async def create_animation(self, event: AstrMessageEvent, spec: str = ""):
-        """用本地 SVG 动画解释一个概念，并把 GIF 或 MP4 动画直接发送给用户。支持 flow、timeline、cycle、comparison、text、chart、slideshow 七种模式。
+    async def create_animation(self, event: AstrMessageEvent, spec: str = None, **kwargs):
+        """用本地 SVG 动画解释一个概念，并把 GIF 或 MP4 动画直接发送给用户。
 
         Args:
             spec(string): 完整的动画 JSON 脚本字符串
@@ -658,18 +662,19 @@ class ImageStudioPlugin(Star):
         if not self.config.get("register_llm_tools", True):
             yield event.plain_result("动画工具未启用，请先在插件配置中开启。")
             return
-        if isinstance(spec, str):
+        raw_spec = spec or kwargs.get("spec") or ""
+        if isinstance(raw_spec, str):
             try:
-                spec = json.loads(spec)
+                raw_spec = json.loads(raw_spec)
             except json.JSONDecodeError as exc:
                 yield event.plain_result(f"动画脚本不是合法 JSON：{exc}")
                 return
-        if not isinstance(spec, dict):
+        if not isinstance(raw_spec, dict):
             yield event.plain_result("动画脚本必须是 JSON 对象。")
             return
-        spec = unwrap_motion_spec(spec)
+        clean_spec = unwrap_motion_spec(raw_spec)
         try:
-            result = await self._render_motion(spec, event)
+            result = await self._render_motion(clean_spec, event)
             for item in self._send_motion(event, result):
                 yield item
         except Exception as exc:  # noqa: BLE001
