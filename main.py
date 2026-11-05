@@ -2,7 +2,7 @@
 
 功能：
 - 聊天指令 /文生图、/t2i 与 /图生图、/i2i。
-- 向 AI 智能体注册 text_to_image 与 image_to_image 两个工具。
+- 向 AI 智能体注册 text_to_image、image_to_image、svg_render、create_animation 四个工具。
 - 可视化设置页：选择提供商、填写 Base URL 与 API Key、检测可用模型、
   文生图/图生图测试，测试通过后一键保存配置。
 """
@@ -19,7 +19,7 @@ import httpx
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import File, Image, Reply, Video
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -31,6 +31,7 @@ from .providers import PROVIDERS, PROVIDER_IDS, resolve_provider
 from .svg_tool import SVGError, render_svg_to_png
 
 PLUGIN_NAME = "astrbot_plugin_image_studio"
+TOOL_NAMES = ["text_to_image", "image_to_image", "svg_render", "create_animation"]
 
 # 插件级全局配置（多服务商档案保存在 profiles.json）。
 GLOBAL_KEYS = [
@@ -124,17 +125,86 @@ def resolve_config(config: dict) -> dict:
     return cfg
 
 
+@register(
+    PLUGIN_NAME,
+    "xky201225",
+    "多服务商文生图、图生图、SVG矢量渲染与概念动画生成插件",
+    "1.1.0",
+)
 class ImageStudioPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
-        super().__init__(context, config)
-        self.config = config
+    def __init__(self, context: Context, config: AstrBotConfig = None):
+        try:
+            super().__init__(context, config)
+        except TypeError:
+            super().__init__(context)
+        self.config = config if config is not None else {}
 
         self.profile_store = ProfileStore(self._data_dir())
         self.profile_store.ensure_from_legacy(dict(self.config))
         self._motion_semaphore: asyncio.Semaphore | None = None
 
         self._register_web_apis()
+        self._ensure_llm_tools_registered()
         logger.info(f"{PLUGIN_NAME} 已加载。")
+
+    @filter.on_astrbot_loaded()
+    async def _on_astrbot_loaded(self):
+        """当 AstrBot 所有模块和人设加载完毕后，再次确保工具处于激活并可见状态。"""
+        self._ensure_llm_tools_registered()
+
+    def _ensure_llm_tools_registered(self) -> None:
+        """强制对齐工具模块路径、激活工具并同步至人设白名单，解决工具不显示问题。"""
+        if not self.config.get("register_llm_tools", True):
+            return
+
+        main_module_path = self.__class__.__module__
+        plugin_pkg = main_module_path.rsplit(".", 1)[0]
+
+        # 1. 修正 star_handlers_registry 中的模块路径
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+            for handler_meta in star_handlers_registry:
+                if handler_meta.handler_module_path.startswith(plugin_pkg):
+                    handler_meta.handler_module_path = main_module_path
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 修正 handler_registry 路径跳过: {exc}")
+
+        # 2. 激活 func_tool_manager 中的工具并绑定实例方法
+        try:
+            tool_mgr = self.context.get_llm_tool_manager()
+            if tool_mgr and hasattr(tool_mgr, "func_list"):
+                active_names = []
+                for tool in tool_mgr.func_list:
+                    t_name = getattr(tool, "name", "")
+                    if t_name in TOOL_NAMES:
+                        tool.handler_module_path = main_module_path
+                        tool.active = True
+                        if hasattr(self, t_name):
+                            tool.handler = getattr(self, t_name)
+                        active_names.append(t_name)
+                logger.info(f"[{PLUGIN_NAME}] 已确认激活 LLM 工具: {active_names}")
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 激活 LLM 工具时出现异常: {exc}")
+
+        # 3. 如果用户的人设配置了局部工具白名单，自动把本插件的 4 个工具加入白名单
+        try:
+            pm = getattr(self.context, "provider_manager", None)
+            personas = getattr(pm, "personas", None) or []
+            for p in personas:
+                if isinstance(p, dict):
+                    tools_list = p.get("tools")
+                    if isinstance(tools_list, list):
+                        for t_name in TOOL_NAMES:
+                            if t_name not in tools_list:
+                                tools_list.append(t_name)
+                else:
+                    tools_list = getattr(p, "tools", None)
+                    if isinstance(tools_list, list):
+                        for t_name in TOOL_NAMES:
+                            if t_name not in tools_list:
+                                tools_list.append(t_name)
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 同步人设工具白名单跳过: {exc}")
 
     # ------------------------------------------------------------------ #
     # 基础工具方法
@@ -377,49 +447,6 @@ class ImageStudioPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"图生图失败：{exc}")
 
-    # ------------------------------------------------------------------ #
-    # LLM 工具（供 AstrBot 智能体调用）
-    # ------------------------------------------------------------------ #
-    @filter.llm_tool(name="text_to_image")
-    async def text_to_image(self, event: AstrMessageEvent, prompt: str) -> MessageEventResult:
-        """根据文字描述生成图片并直接发送给用户。
-
-        Args:
-            prompt(string): 图片的文字描述，例如“一只穿着宇航服的猫”。
-        """
-        if not self.config.get("register_llm_tools", True):
-            yield event.plain_result("文生图工具未启用，请先在插件配置中开启。")
-            return
-        try:
-            paths = await self._generate_and_save(prompt.strip())
-            for path in paths:
-                yield event.image_result(str(path))
-            if not paths:
-                yield event.plain_result("没有生成任何图片。")
-        except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"文生图失败：{exc}")
-
-    @filter.llm_tool(name="image_to_image")
-    async def image_to_image(self, event: AstrMessageEvent, prompt: str) -> MessageEventResult:
-        """根据用户当前消息附带的参考图片进行图生图（改图），并直接发送结果。
-
-        Args:
-            prompt(string): 对参考图片的修改描述，例如“把背景换成星空”。
-        """
-        if not self.config.get("register_llm_tools", True):
-            yield event.plain_result("图生图工具未启用，请先在插件配置中开启。")
-            return
-        try:
-            refs = await self._gather_image_paths(event)
-            if not refs:
-                yield event.plain_result("没有找到参考图片，请先发送一张图片。")
-                return
-            paths = await self._generate_and_save(prompt.strip(), refs)
-            for path in paths:
-                yield event.image_result(str(path))
-        except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"图生图失败：{exc}")
-
     @filter.command("svg绘图", alias={"svgdraw", "矢量绘图"})
     async def cmd_svg_draw(self, event: AstrMessageEvent, svg: GreedyStr):
         """SVG 绘图指令：/svg绘图 <完整 SVG 代码>，或附带 .svg 文件。"""
@@ -438,22 +465,6 @@ class ImageStudioPlugin(Star):
         yield event.plain_result("正在渲染 SVG…")
         try:
             path = await self._render_svg_and_save(source)
-            yield event.image_result(str(path))
-        except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"SVG 绘图失败：{exc}")
-
-    @filter.llm_tool(name="svg_render")
-    async def svg_render(self, event: AstrMessageEvent, svg: str) -> MessageEventResult:
-        """把完整 SVG 代码渲染成 PNG 图片并直接发送，用于流程图、图表、示意图、图标和海报等本地矢量绘图。
-
-        Args:
-            svg(string): 完整的 SVG 文档，必须包含根节点 <svg>、xmlns、width、height 和 viewBox。
-        """
-        if not self.config.get("register_llm_tools", True):
-            yield event.plain_result("SVG 绘图工具未启用，请先在插件配置中开启。")
-            return
-        try:
-            path = await self._render_svg_and_save(svg)
             yield event.image_result(str(path))
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"SVG 绘图失败：{exc}")
@@ -490,11 +501,70 @@ class ImageStudioPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"动画生成失败：{exc}")
 
+    # ------------------------------------------------------------------ #
+    # LLM 工具（供 AstrBot 智能体调用，兼容 Anthropic / OpenAI 协议）
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool(name="text_to_image")
+    async def text_to_image(self, event: AstrMessageEvent, prompt: str):
+        """根据文字描述生成图片并直接发送给用户。
+
+        Args:
+            prompt(string): 图片的文字描述，例如“一只穿着宇航服的猫”。
+        """
+        if not self.config.get("register_llm_tools", True):
+            yield event.plain_result("文生图工具未启用，请先在插件配置中开启。")
+            return
+        try:
+            paths = await self._generate_and_save(prompt.strip())
+            for path in paths:
+                yield event.image_result(str(path))
+            if not paths:
+                yield event.plain_result("没有生成任何图片。")
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"文生图失败：{exc}")
+
+    @filter.llm_tool(name="image_to_image")
+    async def image_to_image(self, event: AstrMessageEvent, prompt: str):
+        """根据用户当前消息附带的参考图片进行图生图（改图），并直接发送结果。
+
+        Args:
+            prompt(string): 对参考图片的修改描述，例如“把背景换成星空”。
+        """
+        if not self.config.get("register_llm_tools", True):
+            yield event.plain_result("图生图工具未启用，请先在插件配置中开启。")
+            return
+        try:
+            refs = await self._gather_image_paths(event)
+            if not refs:
+                yield event.plain_result("没有找到参考图片，请先发送一张图片。")
+                return
+            paths = await self._generate_and_save(prompt.strip(), refs)
+            for path in paths:
+                yield event.image_result(str(path))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"图生图失败：{exc}")
+
+    @filter.llm_tool(name="svg_render")
+    async def svg_render(self, event: AstrMessageEvent, svg: str):
+        """把完整 SVG 代码渲染成 PNG 图片并直接发送，用于流程图、图表、示意图、图标和海报等本地矢量绘图。
+
+        Args:
+            svg(string): 完整的 SVG 文档，必须包含根节点 <svg>、xmlns、width、height 和 viewBox。
+        """
+        if not self.config.get("register_llm_tools", True):
+            yield event.plain_result("SVG 绘图工具未启用，请先在插件配置中开启。")
+            return
+        try:
+            path = await self._render_svg_and_save(svg)
+            yield event.image_result(str(path))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"SVG 绘图失败：{exc}")
+
     @filter.llm_tool(name="create_animation")
-    async def create_animation(self, event: AstrMessageEvent, spec: dict) -> MessageEventResult:
+    async def create_animation(self, event: AstrMessageEvent, spec: str):
         """用本地 SVG 动画解释一个概念，并把 GIF/WebP/MP4 直接发送给用户。
 
-        不要调用文生视频模型。你负责把用户描述转成动画脚本，工具负责逐帧渲染和编码。
+        不要调用文生视频模型。你负责把用户描述转成动画脚本 JSON 字符串，工具负责逐帧渲染和编码。
         先判断用户想解释的是流程、时间顺序、循环、对比、文字强调、数据还是图片轮播，再选择 pattern。
         每个动画保持 3 到 6 个关键节点，节点标签尽量简短（2 到 10 个字），不要堆叠大量元素。
         默认 format=gif；预计超过 8 秒或内容较复杂时用 mp4。slideshow 只在用户提供了图片时使用。
@@ -507,10 +577,9 @@ class ImageStudioPlugin(Star):
         - chart: 图表，需要 chart_type(bar/line)、labels、values 或 series[{name,values}]
         - slideshow: 图片轮播，使用当前消息附带的图片，可选 transition(fade/slide/zoom)
         通用字段：title、subtitle、format(gif/webp/mp4)、width、height、fps、duration、theme(dark/light/ocean/sunset)、accent、background、loop、send_as_file(平台不支持视频时以文件发送)、caption(是否附带生成摘要)。
-        示例：{"pattern":"flow","title":"TCP 三次握手","actors":[{"id":"client","label":"客户端"},{"id":"server","label":"服务器"}],"steps":[{"from":"client","to":"server","label":"SYN"},{"from":"server","to":"client","label":"SYN + ACK"},{"from":"client","to":"server","label":"ACK"}]}
 
         Args:
-            spec(object): 完整的动画 JSON 脚本。
+            spec(string): 完整的动画 JSON 脚本字符串，例如 {"pattern":"flow","title":"TCP 三次握手","actors":[{"id":"client","label":"客户端"},{"id":"server","label":"服务器"}],"steps":[{"from":"client","to":"server","label":"SYN"}]}。
         """
         if not self.config.get("register_llm_tools", True):
             yield event.plain_result("动画工具未启用，请先在插件配置中开启。")
@@ -630,6 +699,7 @@ class ImageStudioPlugin(Star):
             self.config.get("motion_video_as_file")
         )
         await self.config.save_config_async()
+        self._ensure_llm_tools_registered()
         return json_response(
             {
                 "ok": True,
